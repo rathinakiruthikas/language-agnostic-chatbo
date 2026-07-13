@@ -1,0 +1,179 @@
+package com.example.service
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.util.Base64
+import android.util.Log
+import com.example.BuildConfig
+import com.example.data.database.ChatMessageEntity
+import com.example.data.model.*
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.moshi.MoshiConverterFactory
+import retrofit2.http.Body
+import retrofit2.http.POST
+import retrofit2.http.Path
+import retrofit2.http.Query
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.util.concurrent.TimeUnit
+
+interface GeminiApi {
+    @POST("v1beta/models/{model}:generateContent")
+    suspend fun generateContent(
+        @Path("model") model: String,
+        @Query("key") apiKey: String,
+        @Body request: GeminiRequest
+    ): GeminiResponse
+}
+
+object GeminiServiceClient {
+    private const val TAG = "GeminiServiceClient"
+    private const val BASE_URL = "https://generativelanguage.googleapis.com/"
+    
+    // Default model to use as per gemini-api skill
+    const val DEFAULT_MODEL = "gemini-3.5-flash"
+
+    private val moshi = Moshi.Builder()
+        .addLast(KotlinJsonAdapterFactory())
+        .build()
+
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .addInterceptor(HttpLoggingInterceptor().apply {
+            level = HttpLoggingInterceptor.Level.BODY
+        })
+        .build()
+
+    private val retrofit = Retrofit.Builder()
+        .baseUrl(BASE_URL)
+        .client(okHttpClient)
+        .addConverterFactory(MoshiConverterFactory.create(moshi))
+        .build()
+
+    val api: GeminiApi = retrofit.create(GeminiApi::class.java)
+
+    /**
+     * Calls Gemini API to get a response based on the message history.
+     */
+    suspend fun generateResponse(
+        context: Context,
+        history: List<ChatMessageEntity>,
+        systemInstruction: String,
+        modelName: String = DEFAULT_MODEL
+    ): String {
+        val apiKey = BuildConfig.GEMINI_API_KEY
+        if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
+            Log.e(TAG, "API Key is empty or placeholder!")
+            return "Error: Google Gemini API key is not configured. Please add your GEMINI_API_KEY to the Secrets panel in AI Studio."
+        }
+
+        try {
+            // Map the history to Gemini API format
+            val contents = history.map { message ->
+                val parts = mutableListOf<GeminiPart>()
+
+                // If there's an attached file (like an image), we need to encode it
+                if (message.attachedFileUri != null && message.attachedFileType != null) {
+                    val fileUri = Uri.parse(message.attachedFileUri)
+                    if (message.attachedFileType.startsWith("image")) {
+                        val base64Image = encodeImageToBase64(context, fileUri)
+                        if (base64Image != null) {
+                            parts.add(GeminiPart(inlineData = GeminiInlineData(mimeType = "image/jpeg", data = base64Image)))
+                        }
+                    } else {
+                        // For document/text files, we can extract and append the text to the prompt
+                        val docText = readTextFromUri(context, fileUri, message.attachedFileType)
+                        if (docText != null) {
+                            val enrichedText = "[Attached Document: ${message.attachedFileName}]\n---\n$docText\n---\nQuestion: ${message.content}"
+                            parts.add(GeminiPart(text = enrichedText))
+                        }
+                    }
+                }
+
+                // If no enriched text was added for documents, just add the normal text part
+                if (parts.isEmpty()) {
+                    parts.add(GeminiPart(text = message.content))
+                }
+
+                GeminiContent(
+                    role = if (message.role == "user") "user" else "model",
+                    parts = parts
+                )
+            }
+
+            val request = GeminiRequest(
+                contents = contents,
+                generationConfig = GeminiGenerationConfig(temperature = 0.7f),
+                systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstruction)))
+            )
+
+            val response = api.generateContent(modelName, apiKey, request)
+            
+            if (response.error != null) {
+                return "API Error: ${response.error.message ?: "Unknown error occurred"}"
+            }
+
+            return response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                ?: "Error: No response generated by Gemini."
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating response", e)
+            return "Network Error: Unable to connect to Gemini API. ${e.localizedMessage ?: "Please check your internet connection."}"
+        }
+    }
+
+    // --- Helpers ---
+
+    private fun encodeImageToBase64(context: Context, uri: Uri): String? {
+        return try {
+            val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream?.close()
+
+            // Resize image to prevent oversized payloads
+            val maxDimension = 1024
+            val width = bitmap.width
+            val height = bitmap.height
+            val resizedBitmap = if (width > maxDimension || height > maxDimension) {
+                val scale = maxDimension.toFloat() / Math.max(width, height)
+                Bitmap.createScaledBitmap(bitmap, (width * scale).toInt(), (height * scale).toInt(), true)
+            } else {
+                bitmap
+            }
+
+            val outputStream = ByteArrayOutputStream()
+            resizedBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
+            val bytes = outputStream.toByteArray()
+            Base64.encodeToString(bytes, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to encode image", e)
+            null
+        }
+    }
+
+    private fun readTextFromUri(context: Context, uri: Uri, fileType: String): String? {
+        return try {
+            val inputStream = context.contentResolver.openInputStream(uri) ?: return null
+            val content = inputStream.bufferedReader().use { it.readText() }
+            
+            // Limit content length to avoid massive prompts for large files
+            val limit = 8000
+            if (content.length > limit) {
+                content.substring(0, limit) + "\n\n[... document truncated for length ...]"
+            } else {
+                content
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read text from file", e)
+            "Error reading document: ${e.localizedMessage}"
+        }
+    }
+}

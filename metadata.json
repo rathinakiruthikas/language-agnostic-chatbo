@@ -1,0 +1,6 @@
+{
+  "name": "LinguaVoice AI",
+  "description": "Language Agnostic Voice Chatbot using Google Gemini AI",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
